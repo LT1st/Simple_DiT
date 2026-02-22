@@ -233,14 +233,19 @@ class DiT(nn.Module):
         self.patch_size = patch_size
         self.in_channels = in_channels
         self.cond_channels = cond_channels
-        self.total_in_channels = in_channels + cond_channels  # 总输入通道
         self.out_channels = in_channels * 2 if learn_sigma else in_channels
         self.hidden_size = hidden_size
         self.num_patches = (img_size // patch_size) ** 2
         self.learn_sigma = learn_sigma
 
-        # Patch嵌入（支持条件输入）
-        self.x_embedder = PatchEmbed(img_size, patch_size, self.total_in_channels, hidden_size)
+        # Patch嵌入
+        self.x_embedder = PatchEmbed(img_size, patch_size, in_channels, hidden_size)
+
+        # 条件图像嵌入（单独的patchify，用于超分辨率等任务）
+        if cond_channels > 0:
+            self.cond_embedder = PatchEmbed(img_size, patch_size, cond_channels, hidden_size)
+        else:
+            self.cond_embedder = None
 
         # 时间步和标签嵌入
         self.t_embedder = TimestepEmbedder(hidden_size)
@@ -304,12 +309,16 @@ class DiT(nn.Module):
         y: [B] 类别标签
         cond: [B, cond_channels, H, W] 条件图像（可选，用于超分辨率等任务）
         """
-        # 如果有条件输入，拼接到输入通道
-        if cond is not None:
-            x = torch.cat([x, cond], dim=1)  # [B, C+cond_channels, H, W]
+        # 噪声图像 patchify
+        x = self.x_embedder(x)
 
-        # Patch嵌入 + 位置编码
-        x = self.x_embedder(x) + self.pos_embedding
+        # 条件图像单独 patchify 并相加
+        if cond is not None and self.cond_embedder is not None:
+            cond_embed = self.cond_embedder(cond)
+            x = x + cond_embed  # 在embedding维度相加
+
+        # 添加位置编码
+        x = x + self.pos_embedding
 
         # 时间步和类别嵌入
         c = self.t_embedder(t) + self.y_embedder(y, self.training)
