@@ -1,6 +1,21 @@
 """
-DiT超分辨率采样脚本
-使用训练好的模型进行图像超分辨率
+================================================================================
+DiT 超分辨率采样脚本
+================================================================================
+
+【超分辨率采样流程】
+1. 加载低分辨率(LR)图像
+2. 上采样到目标尺寸作为条件cond
+3. 从纯噪声开始，逐步去噪
+4. 每步去噪时，把cond输入模型
+
+【使用方法】
+# 单张图像超分辨率
+python sample_sr.py --lr_image input.png --checkpoint checkpoints_sr/dit_sr_4x_final.pt
+
+# 批量测试（从MNIST测试集）
+python sample_sr.py --batch --checkpoint checkpoints_sr/dit_sr_4x_final.pt
+================================================================================
 """
 
 import os
@@ -14,13 +29,31 @@ from tqdm import tqdm
 from dit import DiT_SR_XS
 
 
+# =============================================================================
+# 第一部分：单步去噪（带条件）
+# =============================================================================
+
 def p_sample(model, x: torch.Tensor, t: int, cond: torch.Tensor, schedule: dict):
     """
-    单步反向扩散采样（带条件）
+    单步反向扩散（带条件图像）
+
+    与普通采样的区别：模型额外接收条件图像cond
+
+    Args:
+        model: 超分辨率模型
+        x: [B, C, H, W] 当前噪声图像
+        t: 当前时间步
+        cond: [B, C, H, W] 条件图像（上采样后的LR）
+        schedule: 噪声调度
+
+    Returns:
+        x_prev: [B, C, H, W] 去噪后的图像
     """
     device = x.device
     t_tensor = torch.full((x.shape[0],), t, device=device, dtype=torch.long)
-    y = torch.zeros(x.shape[0], dtype=torch.long, device=device)  # 类别标签不重要
+
+    # 类别标签对超分辨率不重要，设为0
+    y = torch.zeros(x.shape[0], dtype=torch.long, device=device)
 
     # 模型预测噪声（使用条件）
     predicted_noise = model(x, t_tensor, y, cond=cond)
@@ -30,23 +63,19 @@ def p_sample(model, x: torch.Tensor, t: int, cond: torch.Tensor, schedule: dict)
     alpha = schedule['alphas'][t]
     alpha_cumprod = schedule['alphas_cumprod'][t]
 
-    # 计算去噪后的图像
+    # 计算均值
     sqrt_alpha = torch.sqrt(alpha)
     sqrt_one_minus_alpha_cumprod = torch.sqrt(1 - alpha_cumprod)
-
-    # 计算均值
     mean = (1 / sqrt_alpha) * (x - beta / sqrt_one_minus_alpha_cumprod * predicted_noise)
 
-    # 添加噪声（除了t=0）
+    # 添加噪声
     if t > 0:
         noise = torch.randn_like(x)
-        # 后验方差
         if t > 1:
             alpha_cumprod_prev = schedule['alphas_cumprod'][t - 1]
             posterior_variance = beta * (1 - alpha_cumprod_prev) / (1 - alpha_cumprod)
         else:
             posterior_variance = torch.tensor(0.0)
-
         std = torch.sqrt(posterior_variance)
         x_prev = mean + std * noise
     else:
@@ -58,6 +87,17 @@ def p_sample(model, x: torch.Tensor, t: int, cond: torch.Tensor, schedule: dict)
 def ddpm_sample(model, shape, cond: torch.Tensor, schedule: dict, num_timesteps: int = 1000, device: str = "cpu"):
     """
     完整的DDPM采样过程（带条件）
+
+    Args:
+        model: 超分辨率模型
+        shape: 输出形状 (B, C, H, W)
+        cond: 条件图像 [B, C, H, W]
+        schedule: 噪声调度
+        num_timesteps: 采样步数
+        device: 设备
+
+    Returns:
+        sr_image: 超分辨率结果
     """
     model.eval()
     device = torch.device(device)
@@ -66,24 +106,38 @@ def ddpm_sample(model, shape, cond: torch.Tensor, schedule: dict, num_timesteps:
     x = torch.randn(shape, device=device)
 
     # 反向扩散
-    for t in tqdm(reversed(range(num_timesteps)), desc="Sampling", total=num_timesteps):
+    for t in tqdm(reversed(range(num_timesteps)), desc="超分辨率采样中", total=num_timesteps):
         with torch.no_grad():
             x = p_sample(model, x, t, cond, schedule)
 
     return x
 
 
+# =============================================================================
+# 第二部分：条件图像准备
+# =============================================================================
+
 def prepare_condition(lr_image: torch.Tensor, target_size: int) -> torch.Tensor:
     """
     准备条件图像：将LR图像上采样到目标尺寸
+
+    Args:
+        lr_image: [B, C, H, W] 或 [C, H, W] 低分辨率图像
+        target_size: 目标尺寸
+
+    Returns:
+        cond: [B, C, target_size, target_size] 上采样后的条件图像
     """
     if lr_image.dim() == 3:
         lr_image = lr_image.unsqueeze(0)
 
-    # 上采样到目标尺寸
     cond = F.interpolate(lr_image, size=(target_size, target_size), mode='bilinear', align_corners=False)
     return cond
 
+
+# =============================================================================
+# 第三部分：单图超分辨率
+# =============================================================================
 
 @torch.no_grad()
 def super_resolve(
@@ -94,13 +148,20 @@ def super_resolve(
     device: str = "cpu",
 ):
     """
-    使用训练好的模型进行超分辨率
+    对单张图像进行超分辨率
+
+    Args:
+        checkpoint_path: 模型路径
+        lr_image_path: 低分辨率图像路径（None则生成随机测试图）
+        output_dir: 输出目录
+        num_timesteps: 采样步数
+        device: 设备
     """
     device = torch.device(device)
     os.makedirs(output_dir, exist_ok=True)
 
-    # 加载模型
-    print(f"Loading model from {checkpoint_path}")
+    # ============ 加载模型 ============
+    print(f"加载模型: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
     scale_factor = checkpoint.get('scale_factor', 4)
@@ -112,10 +173,9 @@ def super_resolve(
 
     schedule = checkpoint['schedule']
 
-    # 加载LR图像
+    # ============ 加载/生成LR图像 ============
     if lr_image_path is not None:
-        # 从文件加载
-        print(f"Loading LR image from {lr_image_path}")
+        print(f"加载图像: {lr_image_path}")
         transform = transforms.Compose([
             transforms.Grayscale(num_output_channels=1),
             transforms.Resize((img_size // scale_factor, img_size // scale_factor)),
@@ -124,43 +184,43 @@ def super_resolve(
         ])
         lr_image = transform(Image.open(lr_image_path)).unsqueeze(0).to(device)
     else:
-        # 生成随机测试图像
-        print("Generating random test LR image...")
+        print("生成随机测试图像...")
         lr_image = torch.randn(1, 1, img_size // scale_factor, img_size // scale_factor, device=device)
 
-    # 准备条件图像
+    # ============ 准备条件 ============
     cond = prepare_condition(lr_image, img_size)
 
-    print(f"LR image size: {lr_image.shape}")
-    print(f"Condition size: {cond.shape}")
-    print(f"Target HR size: {img_size}x{img_size}")
+    print(f"LR图像尺寸: {lr_image.shape}")
+    print(f"条件图像尺寸: {cond.shape}")
+    print(f"目标HR尺寸: {img_size}x{img_size}")
 
-    # 采样
-    print("Super-resolving...")
+    # ============ 超分辨率采样 ============
+    print("正在超分辨率...")
     shape = (1, 1, img_size, img_size)
     sr_image = ddpm_sample(model, shape, cond, schedule, num_timesteps, device)
 
-    # 后处理：从[-1, 1]转换到[0, 1]
+    # ============ 后处理 ============
     sr_image = (sr_image + 1) / 2
     sr_image = sr_image.clamp(0, 1)
     cond_vis = (cond + 1) / 2
     cond_vis = cond_vis.clamp(0, 1)
 
-    # 保存结果
-    # 上采样的LR图像（用于对比）
+    # ============ 保存结果 ============
     save_image(cond_vis, os.path.join(output_dir, "lr_upsampled.png"))
-
-    # SR结果
     save_image(sr_image, os.path.join(output_dir, "sr_result.png"))
 
     # 拼接对比
     comparison = torch.cat([cond_vis, sr_image], dim=3)
     save_image(comparison, os.path.join(output_dir, "comparison.png"))
 
-    print(f"Saved results to {output_dir}")
+    print(f"结果保存到: {output_dir}")
 
     return sr_image
 
+
+# =============================================================================
+# 第四部分：批量测试
+# =============================================================================
 
 @torch.no_grad()
 def super_resolve_batch(
@@ -171,8 +231,9 @@ def super_resolve_batch(
     device: str = "cpu",
 ):
     """
-    批量生成超分辨率结果（用于测试）
-    从MNIST测试集加载真实图像
+    批量超分辨率测试（使用MNIST测试集）
+
+    生成对比图：LR上采样 | SR结果 | 原始HR
     """
     from torchvision import datasets
 
@@ -180,7 +241,7 @@ def super_resolve_batch(
     os.makedirs(output_dir, exist_ok=True)
 
     # 加载模型
-    print(f"Loading model from {checkpoint_path}")
+    print(f"加载模型: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
     scale_factor = checkpoint.get('scale_factor', 4)
@@ -199,16 +260,15 @@ def super_resolve_batch(
     ])
     test_dataset = datasets.MNIST(root='./data', train=False, download=True, transform=transform)
 
-    # 采样测试
     hr_images = []
     lr_images = []
     sr_images = []
 
-    for i in tqdm(range(num_samples), desc="Super-resolving"):
+    for i in tqdm(range(num_samples), desc="批量超分辨率"):
         hr_image, _ = test_dataset[i]
         hr_image = hr_image.unsqueeze(0).to(device)
 
-        # 创建LR图像
+        # 创建LR
         lr_size = img_size // scale_factor
         lr = F.interpolate(hr_image, size=(lr_size, lr_size), mode='area')
         cond = F.interpolate(lr, size=(img_size, img_size), mode='bilinear', align_corners=False)
@@ -221,7 +281,7 @@ def super_resolve_batch(
         lr_images.append((cond + 1) / 2)
         sr_images.append((sr + 1) / 2)
 
-    # 合并并保存
+    # 合并保存
     hr_all = torch.cat(hr_images, dim=0).clamp(0, 1)
     lr_all = torch.cat(lr_images, dim=0).clamp(0, 1)
     sr_all = torch.cat(sr_images, dim=0).clamp(0, 1)
@@ -230,31 +290,35 @@ def super_resolve_batch(
     save_image(sr_all, os.path.join(output_dir, "batch_sr.png"), nrow=4)
     save_image(hr_all, os.path.join(output_dir, "batch_hr.png"), nrow=4)
 
-    # 三者对比
+    # 三者对比（每行一张图的三种版本）
     comparison = torch.cat([lr_all, sr_all, hr_all], dim=0)
     save_image(comparison, os.path.join(output_dir, "batch_comparison.png"), nrow=4)
 
-    print(f"Saved batch results to {output_dir}")
+    print(f"批量结果保存到: {output_dir}")
 
+
+# =============================================================================
+# 第五部分：命令行入口
+# =============================================================================
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Super-Resolution with DiT")
+    parser = argparse.ArgumentParser(description="DiT超分辨率")
     parser.add_argument("--checkpoint", type=str, default="checkpoints_sr/dit_sr_4x_final.pt",
-                        help="Path to model checkpoint")
+                        help="模型checkpoint路径")
     parser.add_argument("--lr_image", type=str, default=None,
-                        help="Path to low-resolution input image")
+                        help="低分辨率输入图像路径")
     parser.add_argument("--num_samples", type=int, default=16,
-                        help="Number of samples for batch testing")
+                        help="批量测试时的样本数")
     parser.add_argument("--num_timesteps", type=int, default=1000,
-                        help="Number of diffusion timesteps")
+                        help="采样步数")
     parser.add_argument("--output_dir", type=str, default="outputs_sr",
-                        help="Output directory")
+                        help="输出目录")
     parser.add_argument("--device", type=str, default="cpu",
-                        help="Device (cpu or cuda)")
+                        help="设备 (cpu/cuda)")
     parser.add_argument("--batch", action="store_true",
-                        help="Run batch evaluation on test set")
+                        help="批量测试模式")
 
     args = parser.parse_args()
 
