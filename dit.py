@@ -226,18 +226,21 @@ class DiT(nn.Module):
         mlp_ratio: float = 4.0,
         num_classes: int = 10,
         learn_sigma: bool = False,
+        cond_channels: int = 0,  # 条件图像通道数（用于超分辨率等任务）
     ):
         super().__init__()
         self.img_size = img_size
         self.patch_size = patch_size
         self.in_channels = in_channels
+        self.cond_channels = cond_channels
+        self.total_in_channels = in_channels + cond_channels  # 总输入通道
         self.out_channels = in_channels * 2 if learn_sigma else in_channels
         self.hidden_size = hidden_size
         self.num_patches = (img_size // patch_size) ** 2
         self.learn_sigma = learn_sigma
 
-        # Patch嵌入
-        self.x_embedder = PatchEmbed(img_size, patch_size, in_channels, hidden_size)
+        # Patch嵌入（支持条件输入）
+        self.x_embedder = PatchEmbed(img_size, patch_size, self.total_in_channels, hidden_size)
 
         # 时间步和标签嵌入
         self.t_embedder = TimestepEmbedder(hidden_size)
@@ -293,13 +296,18 @@ class DiT(nn.Module):
         x = x.reshape(x.shape[0], c, h * p, w * p)
         return x
 
-    def forward(self, x: torch.Tensor, t: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, t: torch.Tensor, y: torch.Tensor, cond: torch.Tensor = None) -> torch.Tensor:
         """
         前向传播
         x: [B, C, H, W] 噪声图像
         t: [B] 时间步
         y: [B] 类别标签
+        cond: [B, cond_channels, H, W] 条件图像（可选，用于超分辨率等任务）
         """
+        # 如果有条件输入，拼接到输入通道
+        if cond is not None:
+            x = torch.cat([x, cond], dim=1)  # [B, C+cond_channels, H, W]
+
         # Patch嵌入 + 位置编码
         x = self.x_embedder(x) + self.pos_embedding
 
@@ -331,13 +339,53 @@ def DiT_S(**kwargs):
                depth=6, num_heads=6, mlp_ratio=4.0, **kwargs)
 
 
+def DiT_SR_XS(img_size: int = 28, scale_factor: int = 4, **kwargs):
+    """
+    Extra Small DiT for Super-Resolution
+    img_size: 高分辨率图像大小
+    scale_factor: 超分辨率倍数 (2, 4, 8)
+    """
+    return DiT(
+        img_size=img_size,
+        patch_size=2,
+        in_channels=1,
+        hidden_size=256,
+        depth=4,
+        num_heads=4,
+        mlp_ratio=4.0,
+        cond_channels=1,  # 条件图像通道
+        **kwargs
+    )
+
+
+def DiT_SR_S(img_size: int = 28, scale_factor: int = 4, **kwargs):
+    """
+    Small DiT for Super-Resolution
+    """
+    return DiT(
+        img_size=img_size,
+        patch_size=2,
+        in_channels=1,
+        hidden_size=384,
+        depth=6,
+        num_heads=6,
+        mlp_ratio=4.0,
+        cond_channels=1,
+        **kwargs
+    )
+
+
 if __name__ == "__main__":
     # 简单测试
     device = torch.device("cpu")
+
+    # 测试基础DiT模型
+    print("=" * 50)
+    print("Testing DiT_XS (base model)")
+    print("=" * 50)
     model = DiT_XS().to(device)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-    # 测试前向传播
     x = torch.randn(2, 1, 28, 28).to(device)
     t = torch.randint(0, 1000, (2,)).to(device)
     y = torch.randint(0, 10, (2,)).to(device)
@@ -346,3 +394,21 @@ if __name__ == "__main__":
     print(f"Input shape: {x.shape}")
     print(f"Output shape: {output.shape}")
     print("DiT model test passed!")
+
+    # 测试超分辨率模型
+    print("\n" + "=" * 50)
+    print("Testing DiT_SR_XS (super-resolution model)")
+    print("=" * 50)
+    sr_model = DiT_SR_XS().to(device)
+    print(f"SR Model parameters: {sum(p.numel() for p in sr_model.parameters()):,}")
+
+    x = torch.randn(2, 1, 28, 28).to(device)  # 噪声图像
+    cond = torch.randn(2, 1, 28, 28).to(device)  # 上采样后的LR条件图像
+    t = torch.randint(0, 1000, (2,)).to(device)
+    y = torch.randint(0, 10, (2,)).to(device)
+
+    output = sr_model(x, t, y, cond=cond)
+    print(f"Noisy input shape: {x.shape}")
+    print(f"Condition shape: {cond.shape}")
+    print(f"Output shape: {output.shape}")
+    print("DiT_SR model test passed!")
