@@ -237,21 +237,30 @@ class DiT(nn.Module):
         self.hidden_size = hidden_size
         self.num_patches = (img_size // patch_size) ** 2
         self.learn_sigma = learn_sigma
+        self.use_cond = cond_channels > 0
 
         # Patch嵌入
         self.x_embedder = PatchEmbed(img_size, patch_size, in_channels, hidden_size)
 
-        # 条件图像嵌入（单独的patchify，用于超分辨率等任务）
-        if cond_channels > 0:
+        # 条件图像嵌入（单独的patchify）
+        if self.use_cond:
             self.cond_embedder = PatchEmbed(img_size, patch_size, cond_channels, hidden_size)
+            # 条件图像的位置编码（与噪声图像不同）
+            self.cond_pos_embedding = nn.Parameter(
+                torch.zeros(1, self.num_patches, hidden_size)
+            )
+            # 拼接后投影回hidden_size
+            self.cond_proj = nn.Linear(hidden_size * 2, hidden_size)
         else:
             self.cond_embedder = None
+            self.cond_pos_embedding = None
+            self.cond_proj = None
 
         # 时间步和标签嵌入
         self.t_embedder = TimestepEmbedder(hidden_size)
         self.y_embedder = LabelEmbedder(num_classes, hidden_size)
 
-        # 位置编码（可学习）
+        # 噪声图像的位置编码
         self.pos_embedding = nn.Parameter(
             torch.zeros(1, self.num_patches, hidden_size)
         )
@@ -269,12 +278,23 @@ class DiT(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        # 初始化位置编码
+        # 初始化噪声图像位置编码
         pos_embed = get_2d_sincos_pos_embed(
             self.hidden_size,
             self.img_size // self.patch_size
         )
         self.pos_embedding.data.copy_(pos_embed.unsqueeze(0))
+
+        # 初始化条件图像位置编码（不同的编码）
+        if self.cond_pos_embedding is not None:
+            # 使用不同的初始化，让条件位置编码与噪声位置编码有区别
+            cond_pos_embed = get_2d_sincos_pos_embed(
+                self.hidden_size,
+                self.img_size // self.patch_size
+            )
+            # 加一个偏移量使其不同
+            cond_pos_embed = cond_pos_embed + 0.5
+            self.cond_pos_embedding.data.copy_(cond_pos_embed.unsqueeze(0))
 
         # Zero-init 最终层的bias和adaLN参数
         nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
@@ -309,16 +329,18 @@ class DiT(nn.Module):
         y: [B] 类别标签
         cond: [B, cond_channels, H, W] 条件图像（可选，用于超分辨率等任务）
         """
-        # 噪声图像 patchify
-        x = self.x_embedder(x)
+        # 噪声图像 patchify + 位置编码
+        x_embed = self.x_embedder(x) + self.pos_embedding
 
-        # 条件图像单独 patchify 并相加
-        if cond is not None and self.cond_embedder is not None:
-            cond_embed = self.cond_embedder(cond)
-            x = x + cond_embed  # 在embedding维度相加
-
-        # 添加位置编码
-        x = x + self.pos_embedding
+        # 条件图像单独 patchify + 不同的位置编码，然后拼接
+        if cond is not None and self.use_cond:
+            cond_embed = self.cond_embedder(cond) + self.cond_pos_embedding
+            # 拼接 [B, N, 2*D]
+            x = torch.cat([x_embed, cond_embed], dim=-1)
+            # 投影回 [B, N, D]
+            x = self.cond_proj(x)
+        else:
+            x = x_embed
 
         # 时间步和类别嵌入
         c = self.t_embedder(t) + self.y_embedder(y, self.training)
